@@ -36,7 +36,9 @@ limitations under the License.
 #include "absl/base/attributes.h"
 #include "absl/base/casts.h"
 #include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/strings/str_join.h"
 #include "absl/types/span.h"
 #include "xla/array2d.h"
 #include "xla/hlo/evaluator/hlo_evaluator.h"
@@ -1454,6 +1456,180 @@ class HloEvaluatorTypedVisitor : public ConstDfsHloVisitorWithDefault {
         gs_same ? gs_literal
                 : static_cast<const Literal&>(
                       gs_literal.Convert(PrimitiveType::S64).value()));
+  }
+
+  absl::Status HandleScaledDot(const HloInstruction* dot) {
+    auto lhs = dot->operand(0);
+    auto lhs_scale = dot->operand(1);
+    auto rhs = dot->operand(2);
+    auto rhs_scale = dot->operand(3);
+    CHECK(dot->shape().IsArray());
+    CHECK(lhs->shape().IsArray());
+    CHECK(lhs_scale->shape().IsArray());
+    CHECK(rhs->shape().IsArray());
+    CHECK(rhs_scale->shape().IsArray());
+    const Literal& lhs_literal = parent_->GetEvaluatedLiteralFor(lhs);
+    const Literal& lhs_scale_literal =
+        parent_->GetEvaluatedLiteralFor(lhs_scale);
+    const Literal& rhs_literal = parent_->GetEvaluatedLiteralFor(rhs);
+    const Literal& rhs_scale_literal =
+        parent_->GetEvaluatedLiteralFor(rhs_scale);
+    return HandleScaledDotSlowPathWithLiterals(
+        dot, lhs_literal.Convert(dot->shape().element_type()).value(),
+        lhs_scale_literal.Convert(dot->shape().element_type()).value(),
+        rhs_literal.Convert(dot->shape().element_type()).value(),
+        rhs_scale_literal.Convert(dot->shape().element_type()).value());
+  }
+
+  absl::Status HandleScaledDotSlowPathWithLiterals(
+      const HloInstruction* dot, const Literal& lhs_literal,
+      const Literal& lhs_scale_literal, const Literal& rhs_literal,
+      const Literal& rhs_scale_literal) {
+    const auto& dnums = dot->dot_dimension_numbers();
+
+    const auto lhs_rank = lhs_literal.shape().dimensions().size();
+    const auto rhs_rank = rhs_literal.shape().dimensions().size();
+
+    CHECK(ShapeUtil::SameElementType(lhs_literal.shape(), rhs_literal.shape()));
+    CHECK(ShapeUtil::SameElementType(lhs_literal.shape(), dot->shape()));
+
+    CHECK_EQ(dnums.lhs_batch_dimensions_size(),
+             dnums.rhs_batch_dimensions_size());
+
+    DimensionVector lhs_non_contracting_dims =
+        GetNonContractingDims(lhs_rank, dnums.lhs_contracting_dimensions(),
+                              dnums.lhs_batch_dimensions());
+    DimensionVector lhs_scale_non_contracting_dims =
+        GetNonContractingDims(lhs_rank, dnums.lhs_contracting_dimensions(),
+                              dnums.lhs_batch_dimensions());
+    DimensionVector rhs_non_contracting_dims =
+        GetNonContractingDims(rhs_rank, dnums.rhs_contracting_dimensions(),
+                              dnums.rhs_batch_dimensions());
+    DimensionVector rhs_scale_non_contracting_dims =
+        GetNonContractingDims(rhs_rank, dnums.rhs_contracting_dimensions(),
+                              dnums.rhs_batch_dimensions());
+
+    DimensionVector lhs_non_contracting_dim_sizes;
+    DimensionVector lhs_scale_non_contracting_dim_sizes;
+    DimensionVector rhs_non_contracting_dim_sizes;
+    DimensionVector rhs_scale_non_contracting_dim_sizes;
+    for (int64_t i = 0; i < lhs_non_contracting_dims.size(); ++i) {
+      lhs_non_contracting_dim_sizes.push_back(
+          lhs_literal.shape().dimensions(lhs_non_contracting_dims[i]));
+      lhs_scale_non_contracting_dim_sizes.push_back(
+          lhs_scale_literal.shape().dimensions(
+              lhs_scale_non_contracting_dims[i]));
+      rhs_non_contracting_dim_sizes.push_back(
+          rhs_literal.shape().dimensions(rhs_non_contracting_dims[i]));
+      rhs_scale_non_contracting_dim_sizes.push_back(
+          rhs_scale_literal.shape().dimensions(
+              rhs_scale_non_contracting_dims[i]));
+    }
+
+    DimensionVector contracting_dim_sizes;
+    contracting_dim_sizes.reserve(dnums.lhs_contracting_dimensions_size());
+    DimensionVector lhs_contracting_dims;
+    DimensionVector lhs_scale_contracting_dims;
+    DimensionVector rhs_contracting_dims;
+    DimensionVector rhs_scale_contracting_dims;
+    for (int64_t i = 0; i < dnums.lhs_contracting_dimensions_size(); ++i) {
+      const int64_t lhs_dnum = dnums.lhs_contracting_dimensions(i);
+      const int64_t rhs_dnum = dnums.rhs_contracting_dimensions(i);
+      lhs_contracting_dims.push_back(lhs_dnum);
+      lhs_scale_contracting_dims.push_back(lhs_dnum);
+      rhs_contracting_dims.push_back(rhs_dnum);
+      rhs_scale_contracting_dims.push_back(rhs_dnum);
+      const int64_t dim_size = lhs_literal.shape().dimensions(lhs_dnum);
+      contracting_dim_sizes.push_back(dim_size);
+    }
+    const int64_t total_contraction_size = Product(contracting_dim_sizes);
+    Shape dot_shape = GetShapeWithLayout(dot->shape());
+    Literal result(dot_shape);
+    TF_RETURN_IF_ERROR(result.PopulateParallel<ReturnT>(
+        [&](absl::Span<const int64_t> result_index, int /*thread_id*/) {
+          // Locations in LHS and RHS that we read from.
+          DimensionVector lhs_index(lhs_rank);
+          DimensionVector lhs_scale_index(lhs_rank);
+          DimensionVector rhs_index(rhs_rank);
+          DimensionVector rhs_scale_index(rhs_rank);
+
+          // First come the batch dimensions.
+          int64_t idx = 0;
+          for (int64_t i = 0; i < dnums.lhs_batch_dimensions_size(); i++) {
+            lhs_index[dnums.lhs_batch_dimensions(i)] = result_index[idx];
+            rhs_index[dnums.rhs_batch_dimensions(i)] = result_index[idx];
+            lhs_scale_index[dnums.lhs_batch_dimensions(i)] = result_index[idx];
+            rhs_scale_index[dnums.rhs_batch_dimensions(i)] = result_index[idx];
+            idx++;
+          }
+
+          // Next we have non-contracting dimensions, if any.
+          for (int64_t i = 0; i < lhs_non_contracting_dims.size(); i++) {
+            lhs_index[lhs_non_contracting_dims[i]] = result_index[idx];
+            lhs_scale_index[lhs_scale_non_contracting_dims[i]] =
+                result_index[idx] / (lhs_non_contracting_dim_sizes[i] /
+                                     lhs_scale_non_contracting_dim_sizes[i]);
+            idx++;
+          }
+          for (int64_t i = 0; i < rhs_non_contracting_dims.size(); i++) {
+            rhs_index[rhs_non_contracting_dims[i]] = result_index[idx];
+            rhs_scale_index[rhs_scale_non_contracting_dims[i]] =
+                result_index[idx] / (rhs_non_contracting_dim_sizes[i] /
+                                     rhs_scale_non_contracting_dim_sizes[i]);
+            idx++;
+          }
+
+          // Accumulate resulting product along the contracting dimensions.
+          ElementwiseT result_val = static_cast<ElementwiseT>(0);
+          for (int64_t k = 0; k < total_contraction_size; k++) {
+            const auto lhs =
+                static_cast<ElementwiseT>(lhs_literal.Get<ReturnT>(lhs_index));
+            const auto lhs_scale = static_cast<ElementwiseT>(
+                lhs_scale_literal.Get<ReturnT>(lhs_scale_index));
+            const auto rhs =
+                static_cast<ElementwiseT>(rhs_literal.Get<ReturnT>(rhs_index));
+            const auto rhs_scale = static_cast<ElementwiseT>(
+                rhs_scale_literal.Get<ReturnT>(rhs_scale_index));
+            result_val +=
+                ToArithmeticSafeType(lhs) * ToArithmeticSafeType(lhs_scale) *
+                ToArithmeticSafeType(rhs) * ToArithmeticSafeType(rhs_scale);
+
+            if (parent_->trace_mac_handler_ != nullptr) {
+              const int64_t result_linear_index =
+                  IndexUtil::MultidimensionalIndexToLinearIndex(dot_shape,
+                                                                result_index);
+              const int64_t lhs_linear_index =
+                  IndexUtil::MultidimensionalIndexToLinearIndex(
+                      lhs_literal.shape(), lhs_index);
+              const int64_t rhs_linear_index =
+                  IndexUtil::MultidimensionalIndexToLinearIndex(
+                      rhs_literal.shape(), rhs_index);
+
+              parent_->trace_mac_handler_(result_linear_index, lhs_linear_index,
+                                          rhs_linear_index);
+            }
+
+            // If there are no contracting dimensions, do not try to count down
+            // from -1 to 0; that's an infinite loop.
+            if (!contracting_dim_sizes.empty()) {
+              for (int64_t i = contracting_dim_sizes.size() - 1; i >= 0; --i) {
+                lhs_index[lhs_contracting_dims[i]]++;
+                rhs_index[rhs_contracting_dims[i]]++;
+                if (lhs_index[lhs_contracting_dims[i]] !=
+                    contracting_dim_sizes[i]) {
+                  break;
+                }
+                lhs_index[lhs_contracting_dims[i]] = 0;
+                rhs_index[rhs_contracting_dims[i]] = 0;
+              }
+            }
+          }
+
+          return static_cast<ReturnT>(result_val);
+        }));
+
+    parent_->SetEvaluatedLiteralFor(dot, std::move(result));
+    return absl::OkStatus();
   }
 
   absl::Status HandlePad(const HloInstruction* pad) override {

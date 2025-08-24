@@ -867,6 +867,7 @@ std::optional<ParsedWhileLoop> PatternMatchParseWhileLoop(
     case HloOpcode::kPartitionId:
     case HloOpcode::kRaggedAllToAll:
     case HloOpcode::kRaggedDot:
+    case HloOpcode::kScaledDot:
     case HloOpcode::kRecv:
     case HloOpcode::kRecvDone:
     case HloOpcode::kReduceScatter:
@@ -1125,6 +1126,31 @@ absl::StatusOr<Literal> HloEvaluator::EvaluateDotOp(
   std::unique_ptr<HloInstruction> cloned_instruction =
       HloInstruction::CreateDot(dot_shape, lhs_instr.get(), rhs_instr.get(),
                                 dim_numbers, precision_config);
+  return Evaluate(cloned_instruction.get());
+}
+
+absl::StatusOr<Literal> HloEvaluator::EvaluateScaledDotOp(
+    const DotDimensionNumbers& dim_numbers,
+    const PrecisionConfig& precision_config, const Literal& lhs,
+    const Literal& lhs_scale, const Literal& rhs, const Literal& rhs_scale) {
+  std::unique_ptr<HloInstruction> lhs_instr =
+      HloInstruction::CreateConstant(lhs.Clone());
+  std::unique_ptr<HloInstruction> lhs_scale_instr =
+      HloInstruction::CreateConstant(lhs_scale.Clone());
+  std::unique_ptr<HloInstruction> rhs_instr =
+      HloInstruction::CreateConstant(rhs.Clone());
+  std::unique_ptr<HloInstruction> rhs_scale_instr =
+      HloInstruction::CreateConstant(rhs_scale.Clone());
+
+  TF_ASSIGN_OR_RETURN(
+      Shape dot_shape,
+      ShapeInference::InferDotOpShape(lhs.shape(), rhs.shape(), dim_numbers,
+                                      /*preferred_element_type=*/std::nullopt));
+
+  std::unique_ptr<HloInstruction> cloned_instruction =
+      HloInstruction::CreateScaledDot(
+          dot_shape, lhs_instr.get(), lhs_scale_instr.get(), rhs_instr.get(),
+          rhs_scale_instr.get(), dim_numbers, precision_config);
   return Evaluate(cloned_instruction.get());
 }
 

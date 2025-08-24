@@ -1260,6 +1260,45 @@ TEST_F(HloEvaluatorTest, RaggedDotNonContractingWithBatchDimensions) {
   EXPECT_TRUE(LiteralTestUtil::Equal(expected, result));
 }
 
+TEST_F(HloEvaluatorTest, ScaledDot) {
+  HloComputation::Builder b(TestName());
+
+  auto bf16_instr = [&b](int rows, int cols, float value) {
+    auto array = std::make_unique<Array2D<float>>(rows, cols);
+    array->FillUnique(value);
+    auto literal = LiteralUtil::CreateR2FromArray2D<float>(*array);
+    auto bf16_literal = LiteralUtil::ConvertF32ToBF16(literal);
+    return b.AddInstruction(
+        HloInstruction::CreateConstant(std::move(bf16_literal)));
+  };
+
+  auto lhs_instr = bf16_instr(4, 1, 1.0f);
+  auto lhs_scale_instr = bf16_instr(1, 1, 3.0f);
+  auto rhs_instr = bf16_instr(1, 4, 1.0f);
+  auto rhs_scale_instr = bf16_instr(1, 1, 5.0f);
+
+  Shape shape = ShapeUtil::MakeShape(BF16, {1, 1});
+  DotDimensionNumbers dot_dnums;
+  dot_dnums.add_lhs_contracting_dimensions(0);
+  dot_dnums.add_rhs_contracting_dimensions(1);
+  b.AddInstruction(HloInstruction::CreateScaledDot(
+      shape, lhs_instr, lhs_scale_instr, rhs_instr, rhs_scale_instr, dot_dnums,
+      DefaultPrecisionConfig(4)));
+  m_->AddEntryComputation(b.Build());
+
+  TF_ASSERT_OK_AND_ASSIGN(Literal result, Evaluate());
+
+  // 450 =
+  //   (1 * 3 * 1 * 5) + //  15
+  //   (2 * 3 * 2 * 5) + //  60
+  //   (3 * 3 * 3 * 5) + // 135
+  //   (4 * 3 * 4 * 5)   // 240
+  auto expected_array = Array2D<float>({{450.f}});
+  auto expected = LiteralUtil::CreateR2FromArray2D<float>(expected_array);
+  auto expected_bf16 = LiteralUtil::ConvertF32ToBF16(expected);
+  EXPECT_TRUE(LiteralTestUtil::Equal(expected_bf16, result));
+}
+
 TEST_P(HloEvaluatorBf16Test, DotRank2AndRank1) {
   HloComputation::Builder b(TestName());
 
